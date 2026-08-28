@@ -1,8 +1,5 @@
 name: Investment signal automation
 on:
-  schedule:
-    - cron: "30 13 * * *"
-    - cron: "0 12 * * 0"
   workflow_dispatch:
     inputs:
       weekly:
@@ -30,7 +27,7 @@ jobs:
           HELD_TICKERS: ${{ secrets.HELD_TICKERS }}
           WATCH_TICKERS: ${{ secrets.WATCH_TICKERS }}
         run: |
-          if [ "${{ github.event.schedule }}" = "0 12 * * 0" ] || [ "${{ inputs.weekly }}" = "true" ]; then
+          if [ "${{ inputs.weekly }}" = "true" ]; then
             python hub.py --weekly
           else
             python hub.py
