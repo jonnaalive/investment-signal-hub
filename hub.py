@@ -110,6 +110,46 @@ def rank_events(events: Iterable[dict], held: set[str], watch: set[str], canon: 
     return sorted(ranked, key=lambda x: (-x.score, x.ticker))
 
 
+def explain_why_now(item: RankedTicker) -> tuple[str, str, str]:
+    signals = {event["signal"] for event in item.events}
+    latest = parse_time(item.events[0]["detected_at"]).strftime("%m월 %d일")
+
+    if "guidance_up" in signals and "price_drop" in signals:
+        why = f"{latest}까지 좋은 회사 숫자와 약한 주가가 동시에 잡혔다. 시장 기대치가 더 높았는지, 섹터 매도인지 구분하면 과잉반응 후보를 찾을 수 있다."
+        check = "상향 폭을 직전 회사 목표와 비교하고, FCF·수주·마진 중 빠진 악재가 있는지 확인"
+        avoid = "주가가 싸 보인다는 이유만으로 바로 매수하지 않기"
+    elif "guidance_up" in signals and "price_surge" in signals:
+        why = f"{latest}까지 가이던스 상향이 가격 재평가로 이어졌다. 상향 폭보다 주가 반응이 큰지 지금 확인해야 추격매수와 구조적 개선을 구분할 수 있다."
+        check = "가이던스 중간값 변화율, 다음 연도 연결성, 거래량과 숏커버 가능성 확인"
+        avoid = "급등 자체를 NEW_FACTORY 매수 신호로 해석하지 않기"
+    elif "earnings_downside" in signals and "price_drop" in signals:
+        why = f"{latest}까지 실적 위험과 가격 하락이 겹쳤다. 보유 논리의 KPI가 실제로 훼손됐는지 늦기 전에 확인할 구간이다."
+        check = "가이던스 하향 여부, 일회성 비용, 기존 정본의 폐기조건 충족 여부 확인"
+        avoid = "헤드라인 미스만 보고 자동 손절하지 않기"
+    elif "earnings_screen" in signals and "price_drop" in signals:
+        why = f"{latest}까지 재무 개선 신호와 주가 하락이 엇갈렸다. 실적은 좋아지는데 기대치나 배수만 낮아진 종목인지 볼 가치가 있다."
+        check = "매출 성장의 P·Q 분해, 현금흐름, 하락이 개별 악재인지 섹터 수급인지 확인"
+        avoid = "52주 저가 근접만으로 바닥을 단정하지 않기"
+    elif item.cross_signal:
+        bots = len({event["source_bot"] for event in item.events})
+        why = f"최근 7일 안에 서로 다른 {bots}개 수집기가 같은 종목을 독립적으로 포착했다. 단발성 뉴스보다 정보 변화 가능성이 높아진 시점이다."
+        check = "각 신호가 같은 사건의 중복 보도인지, 서로 다른 펀더멘털·가격 증거인지 확인"
+        avoid = "교차 감지를 매수 확정 신호로 사용하지 않기"
+    elif item.status == "보유":
+        why = f"{latest} 새 신호가 실제 보유 자본과 연결된다. 신규 종목보다 먼저 기존 투자 논리와 충돌하는지 확인해야 한다."
+        check = "정본의 핵심 KPI·폐기조건·다음 실적 확인 항목과 대조"
+        avoid = "신호 하나로 목표가나 매수선을 자동 변경하지 않기"
+    elif item.status == "관심":
+        why = f"{latest} 새 신호가 기존 관심 종목의 진입 전제를 바꿀 수 있다. 가격보다 논리가 먼저 개선됐는지 확인할 때다."
+        check = "기존 관망 사유가 해소됐는지, 정본 이후 새 정보인지 확인"
+        avoid = "관심 등록을 매수 승인으로 오해하지 않기"
+    else:
+        why = f"{latest} 전체 시장 수집에서 새 후보로 잡혔다. 아직 내 종목은 아니므로 기존 보유보다 우선하지 않되, 반복 신호가 생기는지 관찰할 가치가 있다."
+        check = "원자료 존재, 시가총액·유동성, 일회성 여부, 기존 위키 테마 연결 확인"
+        avoid = "단일 신호만으로 NEW_FACTORY를 대량 실행하지 않기"
+    return why, check, avoid
+
+
 def _section(title: str, items: list[RankedTicker]) -> list[str]:
     lines = [f"## {title}", ""]
     if not items:
@@ -119,6 +159,8 @@ def _section(title: str, items: list[RankedTicker]) -> list[str]:
         for event in item.events[:4]:
             label = LABELS.get(event["signal"], event["signal"])
             lines.append(f"- {label}: {event.get('summary', '')}".rstrip(": "))
+        why, check, avoid = explain_why_now(item)
+        lines += [f"- **왜 지금:** {why}", f"- **확인할 것:** {check}", f"- **지금 하지 말 것:** {avoid}"]
         lines.append("")
     return lines
 
@@ -135,7 +177,10 @@ def build_daily(ranked: list[RankedTicker], now: datetime | None = None) -> str:
     for item in factory:
         command = "/new-factory-update" if item.needs_factory == "update" else "/new-factory"
         basis = f"기존 정본 {item.canon_date}" if item.canon_date else "기존 정본 없음"
+        why, check, _ = explain_why_now(item)
         lines.append(f"- **{item.ticker}**: {basis}, 제안 `{command} {item.ticker}`")
+        lines.append(f"  - 선정 이유: {why}")
+        lines.append(f"  - 실행 전 확인: {check}")
     lines += ["", "## 보관", "", f"- 낮은 우선순위 {len([x for x in ranked if x.score < 4])}종", "", "> 조사 우선순위이며 매수·매도 및 NEW_FACTORY 실행을 자동화하지 않는다."]
     return "\n".join(lines)
 
