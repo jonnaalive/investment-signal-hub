@@ -1,0 +1,44 @@
+name: Investment signal automation
+on:
+  schedule:
+    - cron: "30 13 * * *"
+    - cron: "0 12 * * 0"
+  workflow_dispatch:
+    inputs:
+      weekly:
+        description: Build weekly wiki candidate
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: investment-signal-hub
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build report
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          HELD_TICKERS: ${{ secrets.HELD_TICKERS }}
+          WATCH_TICKERS: ${{ secrets.WATCH_TICKERS }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 12 * * 0" ] || [ "${{ inputs.weekly }}" = "true" ]; then
+            python hub.py --weekly
+          else
+            python hub.py
+          fi
+      - name: Persist events and report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/events.json output/
+          git diff --cached --quiet || git commit -m "chore: update signal report"
+          git push
