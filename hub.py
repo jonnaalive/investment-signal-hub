@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections import defaultdict
@@ -20,6 +21,9 @@ SOURCES = {
 }
 LABELS = {
     "guidance_up": "가이던스 상향",
+    "new_guidance": "신규 가이던스",
+    "turnaround_candidate": "턴어라운드 후보",
+    "one_off_guidance": "일회성 요인 포함 가이던스",
     "price_surge": "주가 급등",
     "price_drop": "주가 급락",
     "earnings_downside": "실적 다운사이드",
@@ -53,7 +57,10 @@ def parse_time(value: str) -> datetime:
 def normalize_event(raw: dict) -> dict:
     event = dict(raw)
     event["ticker"] = normalize_ticker(str(event.get("ticker", "")))
-    event["detected_at"] = parse_time(str(event.get("detected_at") or event.get("date") or "")).isoformat()
+    timestamp = event.get("detected_at") or event.get("date")
+    if not timestamp:
+        raise ValueError("신호 날짜 누락: 현재 시각으로 대체하지 않습니다")
+    event["detected_at"] = parse_time(str(timestamp)).isoformat()
     event.setdefault("source_bot", "unknown")
     event.setdefault("signal", "unknown")
     event.setdefault("company", event["ticker"])
@@ -62,14 +69,23 @@ def normalize_event(raw: dict) -> dict:
     return event
 
 
+def event_id(event: dict) -> str:
+    # Prefer the producer's normalized financial event ID. Never hash prose.
+    identity = event.get("event_id") or [event["ticker"], event["source_bot"],
+        event["signal"], event["detected_at"], event.get("source_url", "")]
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
 def deduplicate(events: Iterable[dict]) -> list[dict]:
     unique = {}
     for raw in events:
-        event = normalize_event(raw)
+        try:
+            event = normalize_event(raw)
+        except (ValueError, TypeError):
+            continue
         if not event["ticker"] or event["ticker"] == "UNKNOWN":
             continue
-        day = parse_time(event["detected_at"]).date().isoformat()
-        unique[(event["ticker"], event["source_bot"], event["signal"], day)] = event
+        unique[event_id(event)] = event
     return sorted(unique.values(), key=lambda x: x["detected_at"], reverse=True)
 
 
@@ -103,11 +119,30 @@ def rank_events(events: Iterable[dict], held: set[str], watch: set[str], canon: 
         cross = len({e["source_bot"] for e in ticker_events}) >= 2
         status, score = ("보유", 5) if ticker in held else (("관심", 3) if ticker in watch else ("미보유", 0))
         score += 4 if cross else 0
-        score += 2 if any(e["signal"] == "guidance_up" for e in ticker_events) else 0
+        score += 2 if any(e["signal"] in {"guidance_up", "turnaround_candidate"} for e in ticker_events) else 0
         score += 1 if any(e["signal"] in {"price_surge", "price_drop"} for e in ticker_events) else 0
         score += 1 if any(e.get("source_url") for e in ticker_events) else 0
         ranked.append(RankedTicker(ticker, sorted(ticker_events, key=lambda x: x["detected_at"], reverse=True), status, score, cross, canon.get(ticker, "")))
     return sorted(ranked, key=lambda x: (-x.score, x.ticker))
+
+
+def actionable_events(events: Iterable[dict], canon: dict[str, str], reviews: dict) -> list[dict]:
+    result = []
+    for event in events:
+        ticker = event["ticker"]
+        review = reviews.get(ticker, {})
+        if review.get("status") == "snoozed" and parse_time(review["until"]) > datetime.now(KST):
+            continue
+        # A date-only canon means all events on that date were covered.
+        covered = max(canon.get(ticker, ""), review.get("through", ""))
+        if covered:
+            if len(covered) == 10:
+                if parse_time(event["detected_at"]).date().isoformat() <= covered:
+                    continue
+            elif parse_time(event["detected_at"]) <= parse_time(covered):
+                continue
+        result.append(event)
+    return result
 
 
 def explain_why_now(item: RankedTicker) -> tuple[str, str, str]:
@@ -233,30 +268,124 @@ def fetch_events() -> list[dict]:
     return events
 
 
-def post_discord(markdown: str) -> None:
+def post_discord(markdown: str, *, state: dict | None = None, state_path: Path | None = None, report_key: str = "") -> None:
     webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
     if not webhook:
-        return
+        raise RuntimeError("DISCORD_WEBHOOK_URL 누락: 발송 완료로 기록하지 않습니다")
+    sent_chunks = (state or {}).get("chunks", {})
     for offset in range(0, len(markdown), 1900):
-        requests.post(webhook, json={"content": markdown[offset:offset + 1900]}, timeout=20).raise_for_status()
+        chunk = markdown[offset:offset + 1900]
+        key = hashlib.sha256((report_key + str(offset) + chunk).encode()).hexdigest()
+        if key in sent_chunks:
+            if sent_chunks[key] in {"sending", "uncertain"}:
+                raise RuntimeError("Discord 수신 여부 불명: 자동 재발송 보류, 운영 확인 필요")
+            continue
+        sent_chunks[key] = "sending"
+        if state is not None and state_path is not None:
+            state["chunks"] = sent_chunks
+            save_json(state_path, state)
+        try:
+            requests.post(webhook + ("&" if "?" in webhook else "?") + "wait=true",
+                json={"content": chunk, "allowed_mentions": {"parse": []}}, timeout=20).raise_for_status()
+        except requests.HTTPError:
+            sent_chunks.pop(key)
+            if state is not None and state_path is not None:
+                save_json(state_path, state)
+            raise
+        except Exception:
+            sent_chunks[key] = "uncertain"
+            if state is not None and state_path is not None:
+                save_json(state_path, state)
+            raise
+        sent_chunks[key] = datetime.now(KST).isoformat()
+        if state is not None and state_path is not None:
+            state["chunks"] = sent_chunks
+            save_json(state_path, state)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--weekly", action="store_true")
     parser.add_argument("--no-discord", action="store_true")
+    parser.add_argument("--review-ticker", default="")
+    parser.add_argument("--review-status", choices=["done", "snoozed", "reopen"], default="done")
+    parser.add_argument("--review-until", default="")
     args = parser.parse_args()
+    now = datetime.now(KST)
+    state_path = Path(os.getenv("HUB_STATE_DIR", str(ROOT / "runtime"))) / "delivery.json"
+    state = load_json(state_path, {})
+    if args.review_ticker:
+        if not state:
+            state = {"since": now.isoformat(), "sent": {}, "weeks": {}, "chunks": {}}
+        ticker = normalize_ticker(args.review_ticker)
+        if not ticker.replace(".", "").replace("-", "").isalnum():
+            raise ValueError("유효하지 않은 티커")
+        reviews = state.setdefault("reviews", {})
+        if args.review_status == "reopen":
+            reviews.pop(ticker, None)
+        elif args.review_status == "snoozed":
+            until = parse_time(args.review_until) if args.review_until else now + timedelta(days=30)
+            if until <= now:
+                raise ValueError("보류 종료일은 미래여야 합니다")
+            reviews[ticker] = {"status": "snoozed", "until": until.isoformat()}
+        else:
+            through = parse_time(args.review_until) if args.review_until else now
+            if through > now:
+                raise ValueError("분석 완료 기준일은 미래일 수 없습니다")
+            reviews[ticker] = {"status": "done", "through": through.isoformat()}
+        # Discard a partly delivered report if its recommendations became obsolete.
+        state.pop("pending", None)
+        save_json(state_path, state)
+        print(f"{ticker}: {args.review_status} 기록 완료")
+        return
     merged = retain_window(deduplicate([*load_json(ROOT / "data/events.json", []), *fetch_events()]), 35)
     save_json(ROOT / "data/events.json", merged)
     canon = {k.upper(): v for k, v in load_json(ROOT / "config/canon_index.json", {}).items()}
-    ranked = rank_events(retain_window(merged, 7), parse_tickers(os.getenv("HELD_TICKERS", "")), parse_tickers(os.getenv("WATCH_TICKERS", "")), canon)
-    report = build_weekly(ranked) if args.weekly else build_daily(ranked)
+    reviews = state.get("reviews", {})
+    covered_canon = dict(canon)
+    for ticker, review in reviews.items():
+        if review.get("status") == "done":
+            canon[ticker] = max(canon.get(ticker, ""), review["through"][:10])
+    window = retain_window(merged, 7, now)
+    if not state:
+        # First deployment/cache loss must not replay the existing 7-day backlog.
+        state = {"since": now.isoformat(), "sent": {}, "weeks": {}, "chunks": {}}
+        if not args.no_discord:
+            save_json(state_path, state)
+            print("Delivery state initialized; existing events are the baseline.")
+            return
+        state["since"] = (now - timedelta(days=1)).isoformat()
+    selected = window if args.weekly else [e for e in actionable_events(window, covered_canon, reviews)
+        if event_id(e) not in state["sent"] and parse_time(e["detected_at"]) > parse_time(state["since"])]
+    week = now.strftime("%G-W%V")
+    key = "weekly:" + week if args.weekly else "daily"
+    if (not selected and key not in state.get("pending", {})) or (args.weekly and week in state["weeks"]):
+        print("새 신호 없음: Discord 발송 생략")
+        return
+    changed = {e["ticker"] for e in selected}
+    context = window if args.weekly else [e for e in actionable_events(window, covered_canon, reviews) if e["ticker"] in changed]
+    ranked = rank_events(context, parse_tickers(os.getenv("HELD_TICKERS", "")), parse_tickers(os.getenv("WATCH_TICKERS", "")), canon)
+    report = build_weekly(ranked, now) if args.weekly else build_daily(ranked, now)
     output = ROOT / "output" / ("weekly_wiki_candidate.md" if args.weekly else "daily_digest.md")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(report + "\n", encoding="utf-8")
     print(report)
     if not args.no_discord:
-        post_discord(report)
+        # Keep the exact report for chunk-level retries, including its date.
+        pending = state.setdefault("pending", {}).get(key)
+        if pending:
+            report, delivered_ids = pending["report"], pending["ids"]
+        else:
+            delivered_ids = [event_id(e) for e in selected]
+            state["pending"][key] = {"report": report, "ids": delivered_ids}
+            save_json(state_path, state)
+        post_discord(report, state=state, state_path=state_path, report_key=key)
+        if args.weekly:
+            state["weeks"][week] = now.isoformat()
+        else:
+            state["sent"].update({eid: now.isoformat() for eid in delivered_ids})
+        state["pending"].pop(key, None)
+        save_json(state_path, state)
 
 
 if __name__ == "__main__":

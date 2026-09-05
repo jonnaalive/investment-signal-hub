@@ -1,4 +1,4 @@
-name: Investment signal automation
+name: Investment signal preview (delivery runs in guidance-up-bot)
 on:
   workflow_dispatch:
     inputs:
@@ -28,9 +28,9 @@ jobs:
           WATCH_TICKERS: ${{ secrets.WATCH_TICKERS }}
         run: |
           if [ "${{ inputs.weekly }}" = "true" ]; then
-            python hub.py --weekly
+            python hub.py --weekly --no-discord
           else
-            python hub.py
+            python hub.py --no-discord
           fi
       - name: Persist events and report
         run: |
