@@ -11,6 +11,7 @@ import hub
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setattr(hub, "market_cap_label", lambda ticker: "12.50억 USD · 테스트")
     monkeypatch.setattr(hub, "ROOT", tmp_path)
     monkeypatch.setenv("HUB_STATE_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")

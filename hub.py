@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from typing import Iterable
 
 import requests
 from review_polls import create_poll, sync_polls
+from market_cap import market_cap_label, UNAVAILABLE
 
 ROOT = Path(__file__).resolve().parent
 KST = timezone(timedelta(hours=9))
@@ -186,12 +188,13 @@ def explain_why_now(item: RankedTicker) -> tuple[str, str, str]:
     return why, check, avoid
 
 
-def _section(title: str, items: list[RankedTicker]) -> list[str]:
+def _section(title: str, items: list[RankedTicker], market_caps: dict[str, str] | None = None) -> list[str]:
     lines = [f"## {title}", ""]
     if not items:
         return lines + ["- 없음", ""]
     for item in items[:15]:
         lines += [f"### {item.ticker}: {'교차' if item.cross_signal else item.status} · 점수 {item.score}", f"- 상태: {item.status}"]
+        lines.append(f"- 시가총액: {(market_caps or {}).get(item.ticker, UNAVAILABLE)}")
         for event in item.events[:4]:
             label = LABELS.get(event["signal"], event["signal"])
             lines.append(f"- {label}: {event.get('summary', '')}".rstrip(": "))
@@ -201,11 +204,11 @@ def _section(title: str, items: list[RankedTicker]) -> list[str]:
     return lines
 
 
-def build_daily(ranked: list[RankedTicker], now: datetime | None = None) -> str:
+def build_daily(ranked: list[RankedTicker], now: datetime | None = None, market_caps: dict[str, str] | None = None) -> str:
     now = now or datetime.now(KST)
     lines = [f"# 투자 신호 일일보고: {now:%Y-%m-%d}", ""]
-    lines += _section("즉시 확인", [x for x in ranked if x.score >= 7])
-    lines += _section("조사 대기열", [x for x in ranked if 4 <= x.score < 7])
+    lines += _section("즉시 확인", [x for x in ranked if x.score >= 7], market_caps)
+    lines += _section("조사 대기열", [x for x in ranked if 4 <= x.score < 7], market_caps)
     lines += ["## NEW_FACTORY 검토 후보", ""]
     factory = [x for x in ranked if x.needs_factory]
     if not factory:
@@ -215,6 +218,7 @@ def build_daily(ranked: list[RankedTicker], now: datetime | None = None) -> str:
         basis = f"기존 정본 {item.canon_date}" if item.canon_date else "기존 정본 없음"
         why, check, _ = explain_why_now(item)
         lines.append(f"- **{item.ticker}**: {basis}, 제안 `{command} {item.ticker}`")
+        lines.append(f"  - 시가총액: {(market_caps or {}).get(item.ticker, UNAVAILABLE)}")
         lines.append(f"  - 선정 이유: {why}")
         lines.append(f"  - 실행 전 확인: {check}")
     lines += ["", "## 보관", "", f"- 낮은 우선순위 {len([x for x in ranked if x.score < 4])}종", "", "> 조사 우선순위이며 매수·매도 및 NEW_FACTORY 실행을 자동화하지 않는다."]
@@ -385,7 +389,15 @@ def main() -> None:
     changed = {e["ticker"] for e in selected}
     context = window if args.weekly else [e for e in actionable_events(window, covered_canon, reviews) if e["ticker"] in changed]
     ranked = rank_events(context, parse_tickers(os.getenv("HELD_TICKERS", "")), parse_tickers(os.getenv("WATCH_TICKERS", "")), canon)
-    report = build_weekly(ranked, now) if args.weekly else build_daily(ranked, now)
+    # Repeated pending deliveries keep their original body. No quote calls on
+    # polls-only/no-new-event runs, and each ticker is fetched once per process.
+    caps = {}
+    if not args.weekly and key not in state.get("pending", {}):
+        deadline = time.monotonic() + 60
+        for item in ranked:
+            if (item.score >= 4 or item.needs_factory) and time.monotonic() < deadline:
+                caps[item.ticker] = market_cap_label(item.ticker)
+    report = build_weekly(ranked, now) if args.weekly else build_daily(ranked, now, caps)
     output = ROOT / "output" / ("weekly_wiki_candidate.md" if args.weekly else "daily_digest.md")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(report + "\n", encoding="utf-8")
