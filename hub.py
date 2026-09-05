@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 import requests
+from review_polls import create_poll, sync_polls
 
 ROOT = Path(__file__).resolve().parent
 KST = timezone(timedelta(hours=9))
@@ -310,10 +311,22 @@ def main() -> None:
     parser.add_argument("--review-ticker", default="")
     parser.add_argument("--review-status", choices=["done", "snoozed", "reopen"], default="done")
     parser.add_argument("--review-until", default="")
+    parser.add_argument("--polls-only", action="store_true")
+    parser.add_argument("--test-poll", action="store_true")
     args = parser.parse_args()
     now = datetime.now(KST)
     state_path = Path(os.getenv("HUB_STATE_DIR", str(ROOT / "runtime"))) / "delivery.json"
     state = load_json(state_path, {})
+    save_state = lambda: save_json(state_path, state)
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if args.test_poll:
+        if not state or not webhook:
+            raise RuntimeError("기존 발송 이력과 웹훅이 필요합니다")
+        create_poll({"ticker": "TEST", "through": "2026-09-05T00:00:00+00:00", "ids": ["connection-test-v1"], "test": True}, state, save_state, webhook)
+        result = sync_polls(state, save_state, webhook)
+        if result["failed"]:
+            raise RuntimeError("테스트 투표 조회 실패")
+        return
     if args.review_ticker:
         if not state:
             state = {"since": now.isoformat(), "sent": {}, "weeks": {}, "chunks": {}}
@@ -334,9 +347,16 @@ def main() -> None:
                 raise ValueError("분석 완료 기준일은 미래일 수 없습니다")
             reviews[ticker] = {"status": "done", "through": through.isoformat()}
         # Discard a partly delivered report if its recommendations became obsolete.
+        state.setdefault("active_polls", {}).pop(ticker, None)
         state.pop("pending", None)
         save_json(state_path, state)
         print(f"{ticker}: {args.review_status} 기록 완료")
+        return
+    if not args.no_discord and state:
+        result = sync_polls(state, save_state, webhook)
+        if result["failed"]:
+            raise RuntimeError("투표 확인 실패: 이전 완료 상태로 보고서를 보내지 않습니다")
+    if args.polls_only:
         return
     merged = retain_window(deduplicate([*load_json(ROOT / "data/events.json", []), *fetch_events()]), 35)
     save_json(ROOT / "data/events.json", merged)
@@ -377,9 +397,15 @@ def main() -> None:
             report, delivered_ids = pending["report"], pending["ids"]
         else:
             delivered_ids = [event_id(e) for e in selected]
-            state["pending"][key] = {"report": report, "ids": delivered_ids}
+            specs = [] if args.weekly else [{"ticker": item.ticker,
+                "through": max(e["detected_at"] for e in item.events),
+                "ids": sorted(event_id(e) for e in selected if e["ticker"] == item.ticker)}
+                for item in ranked if item.needs_factory][:30]
+            state["pending"][key] = {"report": report, "ids": delivered_ids, "polls": specs}
             save_json(state_path, state)
         post_discord(report, state=state, state_path=state_path, report_key=key)
+        for spec in state["pending"][key].get("polls", []):
+            create_poll(spec, state, save_state, webhook)
         if args.weekly:
             state["weeks"][week] = now.isoformat()
         else:

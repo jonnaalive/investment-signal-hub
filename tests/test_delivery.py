@@ -16,8 +16,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")
     monkeypatch.setenv("HELD_TICKERS", "ABC")
     monkeypatch.setattr(sys, "argv", ["hub.py"])
-    post = Mock(return_value=Mock(raise_for_status=Mock()))
+    message = {"id": "123", "poll": {"answers": [{"answer_id": i, "poll_media": {"text": label}} for i, label in enumerate(["분석 완료", "30일 보류", "다시 검토"], 7)], "results": {"answer_counts": [], "is_finalized": False}}}
+    post = Mock(return_value=Mock(raise_for_status=Mock(), json=lambda: message))
     monkeypatch.setattr(hub.requests, "post", post)
+    monkeypatch.setattr(hub.requests, "get", Mock(return_value=Mock(status_code=200, raise_for_status=Mock(), json=lambda: message)))
     events = []
     monkeypatch.setattr(hub, "fetch_events", lambda: events)
     return tmp_path, events, post
