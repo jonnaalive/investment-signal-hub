@@ -9,9 +9,11 @@ import market_cap
 def test_daily_displays_cap_and_fallback():
     import hub
     item = hub.RankedTicker("ABC", [{"signal": "guidance_up", "detected_at": "2026-09-05T00:00:00+00:00"}], "보유", 7, False)
-    report = hub.build_daily([item], market_caps={"ABC": "12.50억 USD"})
+    report = hub.build_daily([item], market_caps={"ABC": "12.50억 USD"}, company_infos={"ABC": "필수소비재 · 식료품 유통"})
     assert report.count("시가총액: 12.50억 USD") == 2
+    assert report.count("업종/회사소개: 필수소비재 · 식료품 유통") == 2
     assert "시가총액: 조회 불가" in hub.build_daily([item])
+    assert "업종/회사소개: 조회 불가" in hub.build_daily([item])
 
 
 @pytest.mark.parametrize("value, expected", [(1.25e12, "1.25조 USD"), (1.25e9, "12.50억 USD"), (1e6, "1,000,000 USD")])
@@ -42,3 +44,28 @@ def test_cache_and_class_symbol(monkeypatch):
     assert run.call_args.args[0][-1] == "BRK-B"
     assert run.call_args.kwargs["timeout"] == 20
     market_cap.market_cap_label.cache_clear()
+
+
+@pytest.mark.parametrize("sector, industry, summary, expected", [
+    ("Consumer Defensive", "Grocery Stores", "", "식료품점"),
+    ("Consumer Defensive", "", "", "필수소비재"),
+    (None, None, None, market_cap.UNAVAILABLE),
+    ("Consumer Defensive", "Grocery Stores", "The company distributes food products worldwide.",
+     "식료품점 · 식품 글로벌"),
+])
+def test_describe(sector, industry, summary, expected):
+    assert market_cap._describe(sector, industry, summary) == expected
+
+
+def test_company_info_label_cache_and_failure(monkeypatch):
+    market_cap.company_info_label.cache_clear()
+    run = Mock(return_value=Mock(stdout=json.dumps(
+        {"symbol": "UNFI", "sector": "Consumer Defensive", "industry": "Grocery Stores", "longBusinessSummary": ""})))
+    monkeypatch.setattr(market_cap.subprocess, "run", run)
+    assert market_cap.company_info_label("UNFI") == "식료품점"
+    assert market_cap.company_info_label("UNFI") == "식료품점"
+    assert run.call_count == 1
+    market_cap.company_info_label.cache_clear()
+    monkeypatch.setattr(market_cap.subprocess, "run", Mock(side_effect=subprocess.TimeoutExpired("quote", 20)))
+    assert market_cap.company_info_label("UNFI") == market_cap.UNAVAILABLE
+    market_cap.company_info_label.cache_clear()

@@ -13,7 +13,7 @@ from typing import Iterable
 
 import requests
 from review_polls import create_poll, sync_polls
-from market_cap import market_cap_label, UNAVAILABLE
+from market_cap import market_cap_label, company_info_label, UNAVAILABLE
 
 ROOT = Path(__file__).resolve().parent
 KST = timezone(timedelta(hours=9))
@@ -188,12 +188,14 @@ def explain_why_now(item: RankedTicker) -> tuple[str, str, str]:
     return why, check, avoid
 
 
-def _section(title: str, items: list[RankedTicker], market_caps: dict[str, str] | None = None) -> list[str]:
+def _section(title: str, items: list[RankedTicker], market_caps: dict[str, str] | None = None,
+             company_infos: dict[str, str] | None = None) -> list[str]:
     lines = [f"## {title}", ""]
     if not items:
         return lines + ["- 없음", ""]
     for item in items[:15]:
         lines += [f"### {item.ticker}: {'교차' if item.cross_signal else item.status} · 점수 {item.score}", f"- 상태: {item.status}"]
+        lines.append(f"- 업종/회사소개: {(company_infos or {}).get(item.ticker, UNAVAILABLE)}")
         lines.append(f"- 시가총액: {(market_caps or {}).get(item.ticker, UNAVAILABLE)}")
         for event in item.events[:4]:
             label = LABELS.get(event["signal"], event["signal"])
@@ -204,11 +206,12 @@ def _section(title: str, items: list[RankedTicker], market_caps: dict[str, str] 
     return lines
 
 
-def build_daily(ranked: list[RankedTicker], now: datetime | None = None, market_caps: dict[str, str] | None = None) -> str:
+def build_daily(ranked: list[RankedTicker], now: datetime | None = None, market_caps: dict[str, str] | None = None,
+                 company_infos: dict[str, str] | None = None) -> str:
     now = now or datetime.now(KST)
     lines = [f"# 투자 신호 일일보고: {now:%Y-%m-%d}", ""]
-    lines += _section("즉시 확인", [x for x in ranked if x.score >= 7], market_caps)
-    lines += _section("조사 대기열", [x for x in ranked if 4 <= x.score < 7], market_caps)
+    lines += _section("즉시 확인", [x for x in ranked if x.score >= 7], market_caps, company_infos)
+    lines += _section("조사 대기열", [x for x in ranked if 4 <= x.score < 7], market_caps, company_infos)
     lines += ["## NEW_FACTORY 검토 후보", ""]
     factory = [x for x in ranked if x.needs_factory]
     if not factory:
@@ -218,6 +221,7 @@ def build_daily(ranked: list[RankedTicker], now: datetime | None = None, market_
         basis = f"기존 정본 {item.canon_date}" if item.canon_date else "기존 정본 없음"
         why, check, _ = explain_why_now(item)
         lines.append(f"- **{item.ticker}**: {basis}, 제안 `{command} {item.ticker}`")
+        lines.append(f"  - 업종/회사소개: {(company_infos or {}).get(item.ticker, UNAVAILABLE)}")
         lines.append(f"  - 시가총액: {(market_caps or {}).get(item.ticker, UNAVAILABLE)}")
         lines.append(f"  - 선정 이유: {why}")
         lines.append(f"  - 실행 전 확인: {check}")
@@ -391,13 +395,14 @@ def main() -> None:
     ranked = rank_events(context, parse_tickers(os.getenv("HELD_TICKERS", "")), parse_tickers(os.getenv("WATCH_TICKERS", "")), canon)
     # Repeated pending deliveries keep their original body. No quote calls on
     # polls-only/no-new-event runs, and each ticker is fetched once per process.
-    caps = {}
+    caps, infos = {}, {}
     if not args.weekly and key not in state.get("pending", {}):
         deadline = time.monotonic() + 60
         for item in ranked:
             if (item.score >= 4 or item.needs_factory) and time.monotonic() < deadline:
                 caps[item.ticker] = market_cap_label(item.ticker)
-    report = build_weekly(ranked, now) if args.weekly else build_daily(ranked, now, caps)
+                infos[item.ticker] = company_info_label(item.ticker)
+    report = build_weekly(ranked, now) if args.weekly else build_daily(ranked, now, caps, infos)
     output = ROOT / "output" / ("weekly_wiki_candidate.md" if args.weekly else "daily_digest.md")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(report + "\n", encoding="utf-8")
