@@ -33,9 +33,11 @@ def format_quote(quote: dict, symbol: str, checked_at: str) -> str:
     if not math.isfinite(value) or value <= 0 or not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
         return UNAVAILABLE
     if value >= 1e12:
-        amount = f"{value / 1e12:,.2f}조"
-    elif value >= 1e8:
-        amount = f"{value / 1e8:,.2f}억"
+        amount = f"{value / 1e12:,.2f}T"
+    elif value >= 1e9:
+        amount = f"{value / 1e9:,.2f}B"
+    elif value >= 1e6:
+        amount = f"{value / 1e6:,.2f}M"
     else:
         amount = f"{value:,.0f}"
     return f"{amount} {currency} · Yahoo Finance · 조회 {checked_at}"

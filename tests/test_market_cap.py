@@ -16,7 +16,9 @@ def test_daily_displays_cap_and_fallback():
     assert "업종/회사소개: 조회 불가" in hub.build_daily([item])
 
 
-@pytest.mark.parametrize("value, expected", [(1.25e12, "1.25조 USD"), (1.25e9, "12.50억 USD"), (1e6, "1,000,000 USD")])
+@pytest.mark.parametrize("value, expected", [
+    (1.25e12, "1.25T USD"), (1.25e9, "1.25B USD"), (1.25e6, "1.25M USD"), (5e5, "500,000 USD"),
+])
 def test_units(value, expected):
     assert market_cap.format_quote({"symbol": "ABC", "marketCap": value, "currency": "USD"}, "ABC", "date").startswith(expected)
 
@@ -39,7 +41,7 @@ def test_cache_and_class_symbol(monkeypatch):
     run = Mock(return_value=Mock(stdout=json.dumps({"symbol": "BRK-B", "marketCap": 1e12, "currency": "USD"})))
     monkeypatch.setattr(market_cap.subprocess, "run", run)
     assert "조회" in market_cap.market_cap_label("BRK.B")
-    assert "1.00조 USD" in market_cap.market_cap_label("BRK.B")
+    assert "1.00T USD" in market_cap.market_cap_label("BRK.B")
     assert run.call_count == 1
     assert run.call_args.args[0][-1] == "BRK-B"
     assert run.call_args.kwargs["timeout"] == 20
