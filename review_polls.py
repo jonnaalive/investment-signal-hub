@@ -1,12 +1,16 @@
 """Single-owner Discord polls, read back through the sending webhook token."""
 import hashlib
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 
 CHOICES = {"분석 완료": "done", "30일 보류": "snoozed", "다시 검토": "reopen"}
+# A readback that keeps failing must not block every later report forever.
+MAX_SYNC_FAILURES = 3
+RATE_LIMIT_RETRIES = 3
 
 
 def url_for(webhook, message_id=None):
@@ -25,6 +29,27 @@ def url_for(webhook, message_id=None):
 
 def poll_key(spec):
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+
+
+def seconds_from(response, header, default=1.0):
+    try:
+        return min(float(response.headers.get(header) or default), 10.0)
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_poll(webhook, message_id):
+    """Discord rate-limits webhook message reads, so pace them and honor 429."""
+    url = url_for(webhook, message_id)
+    for _ in range(RATE_LIMIT_RETRIES):
+        response = requests.get(url, timeout=20)
+        if response.status_code == 429:
+            time.sleep(seconds_from(response, "Retry-After") + 0.1)
+            continue
+        if response.headers.get("X-RateLimit-Remaining") == "0":
+            time.sleep(seconds_from(response, "X-RateLimit-Reset-After") + 0.1)
+        return response
+    return response
 
 
 def create_poll(spec, state, save, webhook):
@@ -80,7 +105,7 @@ def sync_polls(state, save, webhook, now=None):
         if record.get("status") != "active" or state.get("active_polls", {}).get(record["ticker"]) != key:
             continue
         try:
-            response = requests.get(url_for(webhook, record["message_id"]), timeout=20)
+            response = fetch_poll(webhook, record["message_id"])
             if response.status_code == 404:
                 record["status"] = "deleted"
                 save()
@@ -89,6 +114,7 @@ def sync_polls(state, save, webhook, now=None):
             message = response.json()
             if str(message.get("id")) != record["message_id"]:
                 raise ValueError("Wrong message returned")
+            record.pop("sync_failures", None)
             stats["checked"] += 1
             results = message.get("poll", {}).get("results")
             if not isinstance(results, dict):
@@ -118,8 +144,18 @@ def sync_polls(state, save, webhook, now=None):
             if results.get("is_finalized"):
                 record["status"] = "closed"
             save()
-        except (requests.RequestException, ValueError, TypeError, KeyError):
-            stats["failed"] += 1
-            print(f"투표 조회 실패: {record['ticker']} (다음 실행 재시도)")
+        except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status else type(exc).__name__
+            misses = record.get("sync_failures", 0) + 1
+            record["sync_failures"] = misses
+            if misses >= MAX_SYNC_FAILURES:
+                record["status"] = "unreadable"
+                stats["unknown"] += 1
+                print(f"투표 조회 포기: {record['ticker']} {detail}, {misses}회 연속 실패로 보고서 차단 해제")
+            else:
+                stats["failed"] += 1
+                print(f"투표 조회 실패: {record['ticker']} {detail} ({misses}/{MAX_SYNC_FAILURES} 다음 실행 재시도)")
+            save()
     print(f"투표 확인: {stats}")
     return stats

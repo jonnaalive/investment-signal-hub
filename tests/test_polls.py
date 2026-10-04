@@ -1,10 +1,11 @@
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import pytest
 import requests
 
-from review_polls import create_poll, sync_polls, poll_key, url_for
+from review_polls import MAX_SYNC_FAILURES, create_poll, sync_polls, poll_key, url_for
 
 
 def fixture(monkeypatch):
@@ -75,6 +76,50 @@ def test_timeout_does_not_create_duplicate(monkeypatch):
         create_poll(spec, state, lambda: None, "https://example.invalid/hook")
     assert post.call_count == 1
     assert state["polls"][poll_key(spec)]["status"] == "uncertain"
+
+
+def test_rate_limited_readback_retries_then_succeeds(monkeypatch):
+    now, spec, message, post = fixture(monkeypatch)
+    ok = Mock(status_code=200, json=lambda: message, raise_for_status=Mock())
+    ok.headers = {}
+    limited = Mock(status_code=429, raise_for_status=Mock())
+    limited.headers = {"Retry-After": "0"}
+    get = Mock(side_effect=[limited, ok])
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(time, "sleep", Mock())
+    state = {}
+    create_poll(spec, state, lambda: None, "https://example.invalid/hook")
+    message["poll"]["results"] = {"answer_counts": [{"id": 11, "count": 1}]}
+    assert sync_polls(state, lambda: None, "https://example.invalid/hook", now)["applied"] == 1
+    assert get.call_count == 2
+
+
+def test_persistent_readback_failure_stops_blocking_reports(monkeypatch):
+    now, spec, message, post = fixture(monkeypatch)
+    monkeypatch.setattr(requests, "get", Mock(side_effect=requests.Timeout()))
+    monkeypatch.setattr(time, "sleep", Mock())
+    state = {}
+    key = create_poll(spec, state, lambda: None, "https://example.invalid/hook")
+    for attempt in range(1, MAX_SYNC_FAILURES):
+        assert sync_polls(state, lambda: None, "https://example.invalid/hook", now)["failed"] == 1
+        assert state["polls"][key]["sync_failures"] == attempt
+    result = sync_polls(state, lambda: None, "https://example.invalid/hook", now)
+    assert result == {"checked": 0, "applied": 0, "unknown": 1, "failed": 0}
+    assert state["polls"][key]["status"] == "unreadable"
+    assert sync_polls(state, lambda: None, "https://example.invalid/hook", now)["failed"] == 0
+
+
+def test_recovered_readback_clears_the_failure_count(monkeypatch):
+    now, spec, message, post = fixture(monkeypatch)
+    state = {}
+    key = create_poll(spec, state, lambda: None, "https://example.invalid/hook")
+    monkeypatch.setattr(requests, "get", Mock(side_effect=requests.Timeout()))
+    monkeypatch.setattr(time, "sleep", Mock())
+    sync_polls(state, lambda: None, "https://example.invalid/hook", now)
+    assert state["polls"][key]["sync_failures"] == 1
+    fixture(monkeypatch)
+    sync_polls(state, lambda: None, "https://example.invalid/hook", now)
+    assert "sync_failures" not in state["polls"][key]
 
 
 def test_webhook_thread_query_preserved():
