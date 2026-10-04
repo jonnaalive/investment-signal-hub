@@ -24,6 +24,23 @@ print(json.dumps({k: info.get(k) for k in ('symbol', 'sector', 'industry', 'long
 """
 
 
+def yahoo_candidates(ticker: str) -> list[str]:
+    """Events and ticker lists compare on base symbols, Yahoo needs the suffix back.
+
+    Korean codes are unique across KOSPI/KOSDAQ but the base alone does not say
+    which, so try both and let the symbol check in the callers pick the real one.
+    """
+    symbol = (ticker or "").strip().upper()
+    # Normalize US share classes only; preserve exchange suffixes (e.g. .HK).
+    if re.fullmatch(r"[A-Z]+\.[AB]", symbol):
+        return [symbol.replace(".", "-")]
+    if re.fullmatch(r"\d{6}", symbol):
+        return [symbol + ".KS", symbol + ".KQ"]
+    if re.fullmatch(r"\d{4}", symbol):
+        return [symbol + ".T"]
+    return [symbol]
+
+
 def format_quote(quote: dict, symbol: str, checked_at: str) -> str:
     value, currency = quote.get("marketCap"), quote.get("currency")
     if str(quote.get("symbol", "")).upper() != symbol:
@@ -45,10 +62,14 @@ def format_quote(quote: dict, symbol: str, checked_at: str) -> str:
 
 @lru_cache(maxsize=256)
 def market_cap_label(ticker: str) -> str:
-    symbol = (ticker or "").strip().upper()
-    # Preserve exchange suffixes (e.g. .HK); normalize US share classes only.
-    if re.fullmatch(r"[A-Z]+\.[AB]", symbol):
-        symbol = symbol.replace(".", "-")
+    for symbol in yahoo_candidates(ticker):
+        label = market_cap_for(symbol)
+        if label != UNAVAILABLE:
+            return label
+    return UNAVAILABLE
+
+
+def market_cap_for(symbol: str) -> str:
     if not re.fullmatch(r"[A-Z0-9][A-Z0-9.^=-]{0,24}", symbol):
         return UNAVAILABLE
     try:
@@ -132,9 +153,14 @@ def _describe(sector: str | None, industry: str | None, summary: str | None) -> 
 
 @lru_cache(maxsize=256)
 def company_info_label(ticker: str) -> str:
-    symbol = (ticker or "").strip().upper()
-    if re.fullmatch(r"[A-Z]+\.[AB]", symbol):
-        symbol = symbol.replace(".", "-")
+    for symbol in yahoo_candidates(ticker):
+        label = company_info_for(symbol)
+        if label != UNAVAILABLE:
+            return label
+    return UNAVAILABLE
+
+
+def company_info_for(symbol: str) -> str:
     if not re.fullmatch(r"[A-Z0-9][A-Z0-9.^=-]{0,24}", symbol):
         return UNAVAILABLE
     try:

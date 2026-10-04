@@ -48,6 +48,37 @@ def test_cache_and_class_symbol(monkeypatch):
     market_cap.market_cap_label.cache_clear()
 
 
+@pytest.mark.parametrize("ticker, expected", [
+    ("011070", ["011070.KS", "011070.KQ"]),
+    ("7181", ["7181.T"]),
+    ("GEV", ["GEV"]),
+    ("BRK.B", ["BRK-B"]),
+    ("TSM", ["TSM"]),
+])
+def test_yahoo_candidates(ticker, expected):
+    assert market_cap.yahoo_candidates(ticker) == expected
+
+
+def test_kosdaq_code_falls_through_to_the_second_suffix(monkeypatch):
+    market_cap.market_cap_label.cache_clear()
+    quotes = {"058610.KQ": {"symbol": "058610.KQ", "marketCap": 2.28e12, "currency": "KRW"}}
+    run = Mock(side_effect=lambda args, **kw: Mock(
+        stdout=json.dumps(quotes.get(args[-1], {"symbol": None, "marketCap": None, "currency": None}))))
+    monkeypatch.setattr(market_cap.subprocess, "run", run)
+    assert "2.28T KRW" in market_cap.market_cap_label("058610")
+    assert [call.args[0][-1] for call in run.call_args_list] == ["058610.KS", "058610.KQ"]
+    market_cap.market_cap_label.cache_clear()
+
+
+def test_us_ticker_still_queries_once(monkeypatch):
+    market_cap.market_cap_label.cache_clear()
+    run = Mock(return_value=Mock(stdout=json.dumps({"symbol": "GEV", "marketCap": 2.6e11, "currency": "USD"})))
+    monkeypatch.setattr(market_cap.subprocess, "run", run)
+    assert "260.00B USD" in market_cap.market_cap_label("GEV")
+    assert run.call_count == 1
+    market_cap.market_cap_label.cache_clear()
+
+
 @pytest.mark.parametrize("sector, industry, summary, expected", [
     ("Consumer Defensive", "Grocery Stores", "", "식료품점"),
     ("Consumer Defensive", "", "", "필수소비재"),
